@@ -1,0 +1,21 @@
+[package]
+name = "nav-gym"
+version = "0.1.0"
+edition = "2021"
+description = "Game-neutral egui navigation development gym"
+
+[lib]
+name = "nav_scene"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nav-gym"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
