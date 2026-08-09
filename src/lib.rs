@@ -4,6 +4,7 @@
 //! into this model. The contract has no knowledge of pre-transformation names,
 //! protocols, or file formats.
 
+mod hta;
 mod pathfinding;
 mod store;
 
@@ -12,6 +13,10 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+pub use hta::{
+    CoarseView, NavConfig, NavShared, NavStatus, Navigator, Threat, WalkView,
+    DEFAULT_SENSE_RADIUS,
+};
 pub use pathfinding::{find_path, PathOptions};
 pub use store::SceneStore;
 

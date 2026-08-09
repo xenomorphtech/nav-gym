@@ -5,7 +5,16 @@ use clap::Parser;
 use eframe::egui::{
     self, Align2, Color32, FontId, Painter, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Vec2,
 };
-use nav_scene::{find_path, CellPrimitive, Collider, Entity, PathOptions, Scene, SceneStore};
+use nav_scene::{
+    find_path, CellPrimitive, Collider, Entity, NavConfig, NavShared, NavStatus, Navigator,
+    PathOptions, Scene, SceneStore, Threat,
+};
+
+mod population;
+mod wander;
+
+use population::{synthetically_populate_actors, PopulationReport, SENSING_RADIUS};
+use wander::WanderSimulation;
 
 #[derive(Parser)]
 #[command(about = "Game-neutral navigation gym")]
@@ -19,6 +28,8 @@ struct Args {
 
 struct NavApp {
     scene: Scene,
+    population: PopulationReport,
+    wander: WanderSimulation,
     database: PathBuf,
     center: [f64; 2],
     zoom: f32,
@@ -36,22 +47,37 @@ struct NavApp {
     path: Option<Vec<[f64; 2]>>,
     route_status: String,
     hover: Option<[f64; 2]>,
+    nav_shared: NavShared,
+    navigator: Navigator,
+    hta_enabled: bool,
 }
 
 impl NavApp {
-    fn new(scene: Scene, database: PathBuf) -> Self {
+    fn new(mut scene: Scene, database: PathBuf) -> Self {
         let bounds = scene.grid.bounds();
+        let population = synthetically_populate_actors(&mut scene, SENSING_RADIUS);
+        let wander = WanderSimulation::from_scene(&scene);
         let agent = scene
             .entities
             .iter()
             .find(|entity| entity.category == "agent")
             .map(|entity| entity.position);
+        let nav_shared = NavShared::from_grid(&scene.grid, NavConfig::default());
+        let navigator = Navigator::new(agent.unwrap_or([
+            (bounds[0][0] + bounds[1][0]) * 0.5,
+            (bounds[0][1] + bounds[1][1]) * 0.5,
+        ]));
         Self {
+            nav_shared,
+            navigator,
+            hta_enabled: true,
             center: agent.unwrap_or([
                 (bounds[0][0] + bounds[1][0]) * 0.5,
                 (bounds[0][1] + bounds[1][1]) * 0.5,
             ]),
             scene,
+            population,
+            wander,
             database,
             zoom: 1.0,
             needs_fit: true,
@@ -83,6 +109,33 @@ impl NavApp {
             .min(size.y / world_height)
             .mul_add(0.94, 0.0)
             .clamp(0.08, 80.0);
+    }
+
+    fn tick_navigator(&mut self, ctx: &egui::Context) {
+        if !self.hta_enabled || self.navigator.status() != NavStatus::Moving {
+            return;
+        }
+        let dt = f64::from(ctx.input(|input| input.stable_dt)).min(0.1);
+        let threats = collect_threats(&self.scene);
+        let status = self
+            .navigator
+            .tick(&self.nav_shared, &self.nav_shared.fine, &threats, dt);
+        let position = self.navigator.position();
+        if let Some(agent) = self
+            .scene
+            .entities
+            .iter_mut()
+            .find(|entity| entity.category == "agent")
+        {
+            agent.position = position;
+        }
+        self.route_status = match status {
+            NavStatus::Moving => "hta*: moving".to_owned(),
+            NavStatus::Arrived => "hta*: arrived".to_owned(),
+            NavStatus::Blocked => "hta*: blocked (no route outside enemy radii)".to_owned(),
+            NavStatus::Idle => "hta*: idle".to_owned(),
+        };
+        ctx.request_repaint();
     }
 
     fn calculate_path(&mut self) {
@@ -146,6 +199,29 @@ impl NavApp {
                     .filter(|entity| entity.category == "actor")
                     .count();
                 ui.label(format!("{resource_count} resources · {actor_count} actors"));
+                ui.small(format!(
+                    "{} sensed within {:.0} · {} synthetic · {:.4}/unit²",
+                    self.population.observed_actors,
+                    self.population.sensing_radius,
+                    self.population.synthetic_actors,
+                    self.population.density_per_square_unit,
+                ));
+                ui.separator();
+                ui.heading("Actor simulation");
+                ui.checkbox(&mut self.wander.enabled, "Wander from spawn centers");
+                ui.add(
+                    egui::Slider::new(&mut self.wander.radius, 1.0..=20.0)
+                        .step_by(0.5)
+                        .text("home radius"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.wander.speed, 0.25..=5.0)
+                        .step_by(0.25)
+                        .text("speed"),
+                );
+                if ui.button("Reset actors to spawn").clicked() {
+                    self.wander.reset(&mut self.scene);
+                }
                 ui.separator();
                 ui.checkbox(&mut self.show_grid, "Map collision geometry");
                 ui.checkbox(&mut self.show_resources, "Resources");
@@ -155,6 +231,19 @@ impl NavApp {
                 ui.checkbox(&mut self.show_labels, "Labels");
                 ui.separator();
                 ui.heading("Pathfinding");
+                ui.checkbox(&mut self.hta_enabled, "HTA* steering (avoid enemy aggro)");
+                if self.hta_enabled {
+                    ui.add(
+                        egui::Slider::new(&mut self.nav_shared.config.speed, 0.5..=10.0)
+                            .step_by(0.25)
+                            .text("agent speed"),
+                    );
+                    if ui.button("Stop agent").clicked() {
+                        self.navigator.stop();
+                        self.route_status = "hta*: idle".to_owned();
+                    }
+                    ui.small("Left click teleports the agent · right click sets its goal");
+                }
                 ui.checkbox(
                     &mut self.include_dynamic_colliders,
                     "Avoid entity colliders",
@@ -226,14 +315,33 @@ impl NavApp {
         }
         if response.clicked_by(PointerButton::Primary) {
             if let Some(position) = response.interact_pointer_pos() {
-                self.start = Some(screen_to_world(position, rect, self.center, self.zoom));
-                self.calculate_path();
+                let world = screen_to_world(position, rect, self.center, self.zoom);
+                if self.hta_enabled {
+                    self.navigator.set_position(world);
+                    if let Some(agent) = self
+                        .scene
+                        .entities
+                        .iter_mut()
+                        .find(|entity| entity.category == "agent")
+                    {
+                        agent.position = world;
+                    }
+                } else {
+                    self.start = Some(world);
+                    self.calculate_path();
+                }
             }
         }
         if response.clicked_by(PointerButton::Secondary) {
             if let Some(position) = response.interact_pointer_pos() {
-                self.goal = Some(screen_to_world(position, rect, self.center, self.zoom));
-                self.calculate_path();
+                let world = screen_to_world(position, rect, self.center, self.zoom);
+                if self.hta_enabled {
+                    self.navigator.set_goal(world);
+                    self.route_status = "hta*: moving".to_owned();
+                } else {
+                    self.goal = Some(world);
+                    self.calculate_path();
+                }
             }
         }
 
@@ -268,6 +376,44 @@ impl NavApp {
                 Stroke::new(2.5, Color32::from_rgb(90, 220, 255)),
             ));
         }
+        if self.hta_enabled {
+            let corridor = self.navigator.corridor();
+            if corridor.len() > 1 {
+                let points = corridor
+                    .iter()
+                    .map(|&point| world_to_screen(point, rect, self.center, self.zoom))
+                    .collect::<Vec<_>>();
+                painter.add(Shape::line(
+                    points,
+                    Stroke::new(1.5, Color32::from_rgba_unmultiplied(180, 180, 200, 110)),
+                ));
+            }
+            let remaining = self.navigator.local_remaining();
+            if !remaining.is_empty() {
+                let mut points = vec![world_to_screen(
+                    self.navigator.position(),
+                    rect,
+                    self.center,
+                    self.zoom,
+                )];
+                points.extend(
+                    remaining
+                        .iter()
+                        .map(|&point| world_to_screen(point, rect, self.center, self.zoom)),
+                );
+                painter.add(Shape::line(
+                    points,
+                    Stroke::new(2.5, Color32::from_rgb(120, 255, 190)),
+                ));
+            }
+            if let Some(goal) = self.navigator.goal() {
+                painter.circle_stroke(
+                    world_to_screen(goal, rect, self.center, self.zoom),
+                    7.0,
+                    Stroke::new(2.5, Color32::from_rgb(120, 255, 190)),
+                );
+            }
+        }
         if let Some(start) = self.start {
             painter.circle_filled(
                 world_to_screen(start, rect, self.center, self.zoom),
@@ -288,11 +434,37 @@ impl NavApp {
 
 impl eframe::App for NavApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.wander.enabled && self.wander.actor_count() != 0 {
+            let dt = ui.ctx().input(|input| input.stable_dt);
+            self.wander.update(&mut self.scene, f64::from(dt));
+            ui.ctx().request_repaint();
+        }
+        self.tick_navigator(ui.ctx());
         self.side_panel(ui);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.canvas(ui));
     }
+}
+
+fn collect_threats(scene: &Scene) -> Vec<Threat> {
+    scene
+        .entities
+        .iter()
+        .filter(|entity| entity.category == "actor")
+        .filter_map(|entity| {
+            let radius = entity
+                .ranges
+                .iter()
+                .filter(|range| range.role == "awareness")
+                .map(|range| range.radius)
+                .fold(0.0_f64, f64::max);
+            (radius > 0.0).then_some(Threat {
+                center: entity.position,
+                radius,
+            })
+        })
+        .collect()
 }
 
 fn world_to_screen(world: [f64; 2], rect: Rect, center: [f64; 2], zoom: f32) -> Pos2 {
@@ -498,7 +670,16 @@ fn paint_entity(
             Stroke::new(1.5, color),
         );
     }
-    if show_label && zoom >= 0.45 {
+    let label_zoom = if entity
+        .attributes
+        .get("synthetic")
+        .is_some_and(|value| value == "true")
+    {
+        4.0
+    } else {
+        0.45
+    };
+    if show_label && zoom >= label_zoom {
         painter.text(
             point + Vec2::new(5.0, -5.0),
             Align2::LEFT_BOTTOM,
