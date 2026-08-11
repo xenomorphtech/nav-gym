@@ -74,14 +74,21 @@ obstacles, rasterized per cell), string-pulls the window path, and steers along
 it. Every interpolated movement step must pass the supercover raycast and stay
 outside every threat disc; the gate enforces half the threat margin less than
 the planner avoids, so legal plans never chatter against it. Moving threats
-are handled explicitly: inside a disc that swept over the agent the gate only
-admits non-inward motion (a disc can be escaped, never crossed through), and
-the agent switches to reactive flee steering — recomputed every tick, so it
-tracks the moving threat with zero plan staleness — until it is back outside.
-When the optimistic coarse view promises a passage the fine grid does not
-deliver, the failed corridor cells are penalized and the global route
-reroutes; persistent failure reports `Blocked` instead of ever entering an
-enemy radius. Ordered goals are snapped to the nearest legal stopping point —
+are handled explicitly: discs that swept over the agent are judged together —
+a step is admitted when the total penetration depth across all containing
+discs does not increase, so a single disc can be escaped but never crossed
+through, while overlapping discs cannot wedge the agent by each vetoing the
+only direction that escapes the other. Inside a disc the agent switches to
+reactive flee steering — recomputed every tick (its angle fan includes the
+exact shell tangents, so a wall-pinned agent slides out sideways), and when
+the fan has no admissible step it falls back to a planned escape through the
+soft-marked containing discs. When the optimistic coarse view promises a
+passage the fine grid does not deliver, the failed corridor cells are
+penalized and the global route reroutes; persistent failure reports `Blocked`
+instead of ever entering an enemy radius. `Blocked` is a report, not a
+terminal state: while the goal stands, the navigator re-probes after a short
+cooldown, so an agent pinned against a wall by wandering mobs holds its
+ground and resumes on its own once a lane opens (`tests/pinned_repro.rs`). Ordered goals are snapped to the nearest legal stopping point —
 a goal on a wall, inside the clearance band, off the grid, or inside an enemy
 shell means "walk as close as safely possible", so short-range orders always
 move the agent instead of silently refusing.

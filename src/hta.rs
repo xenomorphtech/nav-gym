@@ -474,6 +474,7 @@ pub struct Navigator {
     replan_in: f64,
     fail_streak: u32,
     stall_time: f64,
+    retry_in: f64,
     penalties: HashMap<u32, f32>,
     scratch: Scratch,
 }
@@ -492,6 +493,7 @@ impl Navigator {
             replan_in: 0.0,
             fail_streak: 0,
             stall_time: 0.0,
+            retry_in: 0.0,
             penalties: HashMap::new(),
             scratch: Scratch::default(),
         }
@@ -540,6 +542,13 @@ impl Navigator {
         self.reset_plans();
     }
 
+    /// Report `Blocked` and arm the re-probe cooldown; while the goal stands,
+    /// `tick` flips back to `Moving` once the cooldown expires.
+    fn block(&mut self, cfg: &NavConfig) {
+        self.status = NavStatus::Blocked;
+        self.retry_in = cfg.replan_seconds.max(0.05) * 10.0;
+    }
+
     fn reset_plans(&mut self) {
         self.corridor.clear();
         self.corridor_next = 0;
@@ -561,16 +570,27 @@ impl Navigator {
         threats: &[Threat],
         dt: f64,
     ) -> NavStatus {
+        if !dt.is_finite() || dt <= 0.0 {
+            return self.status;
+        }
         if self.status != NavStatus::Moving {
+            // Blocked is a report, not a terminal state: threats wander and
+            // geometry streams in, so a blocked navigator with a standing
+            // goal re-probes after a cooldown instead of freezing forever.
+            if self.status == NavStatus::Blocked && self.goal.is_some() {
+                self.retry_in -= dt;
+                if self.retry_in <= 0.0 {
+                    self.reset_plans();
+                    self.penalties.clear();
+                    self.status = NavStatus::Moving;
+                }
+            }
             return self.status;
         }
         let Some(goal) = self.goal else {
             self.status = NavStatus::Idle;
             return self.status;
         };
-        if !dt.is_finite() || dt <= 0.0 {
-            return self.status;
-        }
         let cfg = &shared.config;
         let inflate = cfg.threat_margin + cfg.agent_radius;
 
@@ -602,11 +622,26 @@ impl Navigator {
             // A disc swept over the agent. A goal-directed plan is stale
             // against a moving threat within a tick, so switch to reactive
             // flee steering recomputed every tick until the agent is out;
-            // the movement gate still forbids any inward motion.
+            // the movement gate still forbids increasing total penetration.
             self.local.clear();
             self.local_next = 0;
             self.replan_in = 0.0;
-            self.flee(shared, sensed, dt)
+            let fled = self.flee(shared, sensed, dt);
+            if fled > 1e-9 {
+                fled
+            } else {
+                // The reactive fan has no admissible step (pinned against
+                // terrain with other discs covering the fan): fall back to a
+                // planned escape. Containing discs are soft in the local
+                // planner, so a least-cost way out exists whenever the gate
+                // admits one; if even that fails, the agent holds and the
+                // Blocked retry above keeps re-probing as the discs move.
+                self.replan(shared, sensed, threats, goal);
+                if self.status != NavStatus::Moving {
+                    return self.status;
+                }
+                self.steer(shared, sensed, dt)
+            }
         } else {
             self.replan_in -= dt;
             if self.local_next >= self.local.len() || self.replan_in <= 0.0 {
@@ -629,7 +664,7 @@ impl Navigator {
                         self.corridor.len()
                     );
                 }
-                self.status = NavStatus::Blocked;
+                self.block(cfg);
             }
         } else {
             self.stall_time = 0.0;
@@ -699,7 +734,7 @@ impl Navigator {
             if std::env::var_os("NAV_DEBUG").is_some() {
                 eprintln!("no legal stopping point near goal {goal:?}");
             }
-            self.status = NavStatus::Blocked;
+            self.block(cfg);
             return;
         };
         self.snapped = snapped;
@@ -707,7 +742,7 @@ impl Navigator {
             if std::env::var_os("NAV_DEBUG").is_some() {
                 eprintln!("global plan failed at {:?}", self.position);
             }
-            self.status = NavStatus::Blocked;
+            self.block(cfg);
             return;
         }
         match self.plan_local(shared, sensed, snapped) {
@@ -743,7 +778,7 @@ impl Navigator {
                 self.local_next = 0;
                 self.replan_in = cfg.replan_seconds * 0.25;
                 if self.fail_streak >= cfg.max_fail_streak {
-                    self.status = NavStatus::Blocked;
+                    self.block(cfg);
                 }
             }
         }
@@ -1253,12 +1288,26 @@ impl Navigator {
             [1.0, 0.0]
         };
         let step = shared.config.speed.max(0.0) * dt;
-        for angle in [0.0, 0.5, -0.5, 1.0, -1.0, 1.6, -1.6, 2.2, -2.2] {
+        // The fan includes the exact tangents (±π/2): sliding along the shell
+        // of the pinning disc is always non-inward, so a wall-pinned agent
+        // can slide out sideways instead of holding.
+        for angle in [
+            0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            1.3,
+            -1.3,
+            std::f64::consts::FRAC_PI_2,
+            -std::f64::consts::FRAC_PI_2,
+            1.9,
+            -1.9,
+            2.2,
+            -2.2,
+        ] {
             let (sin, cos) = f64::sin_cos(angle);
-            let direction = [
-                base[0] * cos - base[1] * sin,
-                base[0] * sin + base[1] * cos,
-            ];
+            let direction = [base[0] * cos - base[1] * sin, base[0] * sin + base[1] * cos];
             let next = [
                 self.position[0] + direction[0] * step,
                 self.position[1] + direction[1] * step,
@@ -1309,9 +1358,12 @@ impl Navigator {
     /// Movement gate: every interpolated step must pass the supercover raycast
     /// against the sensed grid and stay outside every threat disc. The gate
     /// enforces half the threat margin less than the planner avoids, so a
-    /// legally planned path can never chatter against the gate; inside a disc
-    /// that swept over the agent, only non-inward motion is admitted so the
-    /// disc can be escaped but never crossed through.
+    /// legally planned path can never chatter against the gate. Discs that
+    /// swept over the agent are judged together: a step is admitted when the
+    /// TOTAL penetration depth across all containing discs does not increase,
+    /// so a single disc can be escaped but never crossed through, while
+    /// overlapping discs cannot wedge the agent by each vetoing the only
+    /// direction that escapes the other.
     fn move_allowed(
         &self,
         shared: &NavShared,
@@ -1326,21 +1378,20 @@ impl Navigator {
             return false;
         }
         let slack = shared.config.threat_margin * 0.5;
+        let mut depth_from = 0.0;
+        let mut depth_to = 0.0;
         for threat in &self.scratch.nearby {
             let gate_radius = (threat.radius - slack).max(0.0);
             let radius_sq = gate_radius * gate_radius;
-            let from_distance = distance_sq(from, threat.center);
-            if from_distance <= radius_sq {
-                // The disc swept over us: only non-inward motion is allowed,
-                // so the disc can be escaped but never crossed through.
-                if distance_sq(to, threat.center) < from_distance - 1e-9 {
-                    return false;
-                }
+            let from_distance_sq = distance_sq(from, threat.center);
+            if from_distance_sq <= radius_sq {
+                depth_from += gate_radius - from_distance_sq.sqrt();
+                depth_to += (gate_radius - distance(to, threat.center)).max(0.0);
             } else if segment_distance_sq(from, to, threat.center) <= radius_sq {
                 return false;
             }
         }
-        true
+        depth_to <= depth_from + 1e-9
     }
 }
 
